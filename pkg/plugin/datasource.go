@@ -4,14 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
+	"time"
+
 	"github.com/google/uuid"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
 	"github.com/grafana/grafana-plugin-sdk-go/live"
 	"github.com/jellydator/ttlcache/v3"
 	"github.com/nats-io/nats.go"
 	"github.com/sandstormmedia/nats/pkg/plugin/goja"
-	"sync"
-	"time"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/instancemgmt"
@@ -31,7 +32,7 @@ var (
 )
 
 // NewDatasource creates a new datasource instance.
-func NewDatasource(config backend.DataSourceInstanceSettings) (instancemgmt.Instance, error) {
+func NewDatasource(ctx context.Context, config backend.DataSourceInstanceSettings) (instancemgmt.Instance, error) {
 	return &Datasource{
 		uid:                  config.UID,
 		natsConnOnce:         &sync.Once{},
