@@ -178,6 +178,11 @@ function _setup(_nats, _bytesToStr, _strToBytes, _parseDuration) {
             // keep falsy objects
             return __subscription;
         }
+        // Register the subscription, so that it is ended when the script is done. typeof is safe
+        // here even in strict mode, because the tracker is only defined while a script runs.
+        if (typeof __trackSubscription === "function") {
+            __trackSubscription(__subscription);
+        }
         
         const subscription = Object.create(__subscription);
         subscription.NextMsg = nullOnTimeout((timeout) => wrapMsg(__subscription.NextMsg(_parseDuration(timeout))));
@@ -222,6 +227,25 @@ func wrapJsScript(in string) string {
 `, in)
 }
 
+// trackSubscriptions registers a tracker for subscriptions a script creates, and returns a cleanup
+// function that ends them again. Without it, a script that subscribes - f.e. to collect several
+// replies to one request - leaves the subscription on the shared connection for good, and every
+// dashboard refresh adds another one.
+func trackSubscriptions(vm *goja.Runtime) func() {
+	var subscriptions []*nats.Subscription
+	_ = vm.Set("__trackSubscription", func(subscription *nats.Subscription) {
+		if subscription != nil {
+			subscriptions = append(subscriptions, subscription)
+		}
+	})
+	return func() {
+		for _, subscription := range subscriptions {
+			_ = subscription.Unsubscribe()
+		}
+		_ = vm.GlobalObject().Delete("__trackSubscription")
+	}
+}
+
 func ConvertMessage(nc *nats.Conn, msg *nats.Msg, jsFn string) (*data.Frame, error) {
 	if jsFn == "" {
 		jsFn = `
@@ -236,6 +260,7 @@ func ConvertMessage(nc *nats.Conn, msg *nats.Msg, jsFn string) (*data.Frame, err
 	if err := vm.Set("__msg", msg); err != nil {
 		return nil, err
 	}
+	defer trackSubscriptions(vm)()
 	// reset request-scoped variables - this way, we can have a clean VM again.
 	defer func() {
 		_ = vm.GlobalObject().Delete("__nc")
@@ -264,6 +289,7 @@ func RunScript(nc *nats.Conn, jsFn string, timeout time.Duration) (*data.Frame, 
 	if err := vm.Set("__kv", kvFn(nc, timeout)); err != nil {
 		return nil, err
 	}
+	defer trackSubscriptions(vm)()
 	// reset request-scoped variables - this way, we can have a clean VM again.
 	defer func() {
 		_ = vm.GlobalObject().Delete("__nc")

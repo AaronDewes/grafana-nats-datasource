@@ -31,12 +31,26 @@ var (
 	_ instancemgmt.InstanceDisposer = (*Datasource)(nil)
 )
 
+// streamResponseTTL is how long an unused streaming response is kept. The TTL is extended on every
+// message, so it only expires for streams nobody is feeding or reading any more.
+const streamResponseTTL = 5 * time.Minute
+
 // NewDatasource creates a new datasource instance.
 func NewDatasource(ctx context.Context, config backend.DataSourceInstanceSettings) (instancemgmt.Instance, error) {
-	return &Datasource{
+	ds := &Datasource{
 		uid:                  config.UID,
+		streamTTL:            streamResponseTTL,
 		streamResponsesSoFar: ttlcache.New[string, *streamResponse](),
-	}, nil
+	}
+	// An evicted stream must end its NATS subscription, otherwise the subscription outlives the
+	// entry that owns it and keeps receiving messages nobody reads.
+	ds.streamResponsesSoFar.OnEviction(func(_ context.Context, _ ttlcache.EvictionReason, item *ttlcache.Item[string, *streamResponse]) {
+		item.Value().close()
+	})
+	// ttlcache only removes expired items while this loop runs. Without it, Get returns nil for an
+	// expired entry but the entry itself stays in the cache forever.
+	go ds.streamResponsesSoFar.Start()
+	return ds, nil
 }
 
 // Dispose here tells plugin SDK that plugin wants to clean up resources when a new instance
@@ -44,6 +58,9 @@ func NewDatasource(ctx context.Context, config backend.DataSourceInstanceSetting
 // be disposed and a new one will be created using NewSampleDatasource factory function.
 func (ds *Datasource) Dispose() {
 	// Clean up datasource instance resources.
+	ds.streamResponsesSoFar.Stop()
+	// DeleteAll evicts every entry, which ends the NATS subscriptions via the eviction hook above.
+	ds.streamResponsesSoFar.DeleteAll()
 	ds.closeNats()
 }
 
@@ -52,6 +69,8 @@ func (ds *Datasource) Dispose() {
 type Datasource struct {
 	uid                  string
 	streamResponsesSoFar *ttlcache.Cache[string, *streamResponse]
+	// streamTTL is how long an unused streaming response is kept; a field so that tests can shorten it.
+	streamTTL time.Duration
 
 	// natsConnMu guards natsConn, so that only one NATS connection is created without any race conditions
 	natsConnMu sync.Mutex
@@ -59,13 +78,72 @@ type Datasource struct {
 	natsConn *nats.Conn
 }
 
+// streamResponse holds the state of a single streaming query. The NATS message handler writes to it
+// while RunStream reads from it, so the fields are guarded by mu.
 type streamResponse struct {
-	onNewMessages          chan bool
-	currentFrame           *data.Frame
-	currentErr             error
-	cancelNatsSubscription context.CancelFunc
-	// set to true once the NATS subscription is set up. Required for deterministic tests.
-	subscribed bool
+	mu           sync.Mutex
+	currentFrame *data.Frame
+	currentErr   error
+	subscription *nats.Subscription
+
+	// onNewMessages wakes RunStream up. It only signals that something changed - the frame itself
+	// is read from currentFrame - so a full buffer can be ignored instead of blocking the sender.
+	onNewMessages chan bool
+
+	cancel    context.CancelFunc
+	closeOnce sync.Once
+}
+
+// notify stores a new frame or error and wakes RunStream, without ever blocking the caller. The
+// NATS message handler runs on the subscription's dispatch goroutine, so blocking here would stall
+// the subscription and pile messages up in its pending queue until they are dropped.
+func (sr *streamResponse) notify(frame *data.Frame, err error) {
+	sr.mu.Lock()
+	if frame != nil {
+		sr.currentFrame = frame
+	}
+	if err != nil {
+		sr.currentErr = err
+	}
+	sr.mu.Unlock()
+
+	select {
+	case sr.onNewMessages <- true:
+	default:
+		// RunStream has not caught up yet - it reads the latest frame on its next wake-up anyway.
+	}
+}
+
+// state returns the latest frame and error.
+func (sr *streamResponse) state() (*data.Frame, error) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	return sr.currentFrame, sr.currentErr
+}
+
+func (sr *streamResponse) setSubscription(subscription *nats.Subscription) {
+	sr.mu.Lock()
+	sr.subscription = subscription
+	sr.mu.Unlock()
+}
+
+// close ends the NATS subscription right away, instead of waiting for the next message to notice
+// the cancelled context. It is safe to call several times and from several goroutines.
+func (sr *streamResponse) close() {
+	sr.closeOnce.Do(func() {
+		if sr.cancel != nil {
+			sr.cancel()
+		}
+		sr.mu.Lock()
+		subscription := sr.subscription
+		sr.subscription = nil
+		sr.currentFrame = nil
+		sr.mu.Unlock()
+
+		if subscription != nil {
+			_ = subscription.Unsubscribe()
+		}
+	})
 }
 
 func (ds *Datasource) SubscribeStream(_ context.Context, request *backend.SubscribeStreamRequest) (*backend.SubscribeStreamResponse, error) {
@@ -90,32 +168,34 @@ func (ds *Datasource) PublishStream(_ context.Context, _ *backend.PublishStreamR
 
 func (ds *Datasource) RunStream(ctx context.Context, request *backend.RunStreamRequest, sender *backend.StreamSender) error {
 	value := ds.streamResponsesSoFar.Get(request.Path)
-	if value != nil {
-		for {
-			select {
-			case <-ctx.Done():
-				// we are done.
-				value.Value().cancelNatsSubscription()
-				return nil
-			case <-value.Value().onNewMessages:
-				// new message
-				if value.Value().currentErr != nil {
-					// error while processing messages -> exit stream
-					return value.Value().currentErr
-				}
+	if value == nil {
+		return fmt.Errorf("no data found for stream %s", request.Path)
+	}
 
-				// no error -> send the updated frame to the user.
-				if value.Value().currentFrame != nil {
-					err := sender.SendFrame(value.Value().currentFrame, data.IncludeAll)
-					if err != nil {
-						// TODO: close NATS subscription!
-						return value.Value().currentErr
-					}
-				}
+	// The subscription exists to feed this stream, so it ends together with it. Dropping the cache
+	// entry runs the eviction hook, which unsubscribes and releases the last frame.
+	defer ds.streamResponsesSoFar.Delete(request.Path)
+
+	sr := value.Value()
+	for {
+		select {
+		case <-ctx.Done():
+			// the panel is gone - we are done.
+			return nil
+		case <-sr.onNewMessages:
+			frame, err := sr.state()
+			if err != nil {
+				// error while processing messages -> exit stream
+				return err
+			}
+			if frame == nil {
+				continue
+			}
+			if err := sender.SendFrame(frame, data.IncludeAll); err != nil {
+				return err
 			}
 		}
 	}
-	return fmt.Errorf("no data found for stream %s", request.Path)
 }
 
 // QueryData handles multiple queries and returns multiple responses.
@@ -267,103 +347,121 @@ func (ds *Datasource) requestReply(nc *nats.Conn, qm queryModel) (*data.Frame, e
 // subscribe handles a NATS subscription call in streaming fashion.
 // TODO explain how done
 // inspired by https://github.com/grafana/grafana-iot-twinmaker-app/blob/0947ce1ff0afec8372cae624566726e68687137b/pkg/plugin/datasource.go
-func (ds *Datasource) subscribe(_ context.Context, qm queryModel, nc *nats.Conn) backend.DataResponse {
+func (ds *Datasource) subscribe(ctx context.Context, qm queryModel, nc *nats.Conn) backend.DataResponse {
 	requestUuid := uuid.NewString()
 	if len(qm.StreamRequestUuidForTesting) > 0 {
 		requestUuid = qm.StreamRequestUuidForTesting
 	}
 
-	// if the context is cancelled, the NATS subscription should end.
-	ctx, cancel := context.WithCancel(context.Background())
+	// The subscription outlives this request - it is handed over to RunStream - so it gets its own
+	// context instead of the request's, and is ended via sr.close().
+	subscriptionCtx, cancel := context.WithCancel(context.Background())
 	sr := &streamResponse{
-		onNewMessages:          make(chan bool, 100), // we use a buffered channel here, because we do not want to block at all, if possible.
-		currentFrame:           nil,
-		cancelNatsSubscription: cancel,
+		onNewMessages: make(chan bool, 1),
+		cancel:        cancel,
 	}
 
-	// TODO: do not hardcode TTL here.
-	ds.streamResponsesSoFar.Set(requestUuid, sr, 5*time.Minute)
+	// firstResult carries the first message back to this request, which answers it synchronously so
+	// that the panel gets a frame with a schema. The channel is deliberately unbuffered: a send only
+	// succeeds while this request is still waiting, so a message that arrives after the timeout is
+	// streamed instead of being dropped, and never counted twice.
+	type firstResult struct {
+		frame *data.Frame
+		err   error
+	}
+	first := make(chan firstResult)
 
-	// NOTE: we wait until the 1st message is received
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	i := 0
-	var subscription *nats.Subscription
-	var err error
-	var firstFrame *data.Frame
-	subscription, err = nc.Subscribe(qm.NatsSubject, func(msg *nats.Msg) {
+	// handOver passes a result to the waiting request, and reports whether it got there.
+	handOver := func(result firstResult) bool {
 		select {
-		case <-ctx.Done():
-			log.DefaultLogger.Debug("Cancelling NATS subscription")
-			_ = subscription.Unsubscribe()
+		case first <- result:
+			return true
 		default:
-			log.DefaultLogger.Debug("Received NATS Message")
-			// extend TTL everytime we receive a msg.
-			ds.streamResponsesSoFar.Touch(requestUuid)
-			i++
-			frame, err := goja.ConvertMessage(nc, msg, qm.JsFn)
-			if err != nil {
-				log.DefaultLogger.Error(fmt.Sprintf("could not convert message %d - error in tamarin script: %s", i, err))
-
-				sr.currentErr = fmt.Errorf("could not convert message %d - error in tamarin script: %w", i, err)
-				sr.onNewMessages <- true
-				_ = subscription.Unsubscribe()
-				if i == 1 {
-					// for 1st message, answer synchronously
-					wg.Done()
-				}
-				return
-			}
-			if err != nil {
-				log.DefaultLogger.Error(fmt.Sprintf("could not convert message %d - could not be converted to data frame: %s", i, err))
-
-				sr.currentErr = fmt.Errorf("could not convert message %d - could not be converted to data frame: %w", i, err)
-				sr.onNewMessages <- true
-				_ = subscription.Unsubscribe()
-				if i == 1 {
-					// for 1st message, answer synchronously
-					wg.Done()
-				}
-				return
-			}
-
-			// no error :) -> notify sender
-			if i == 1 {
-				// for 1st message, answer synchronously
-				firstFrame = frame
-				wg.Done()
-			} else {
-				sr.currentFrame = frame
-				sr.onNewMessages <- true
-			}
+			return false
 		}
-	})
+	}
 
+	messages := 0
+	subscription, err := nc.Subscribe(qm.NatsSubject, func(msg *nats.Msg) {
+		if subscriptionCtx.Err() != nil {
+			// the stream is gone - make sure the subscription goes with it.
+			sr.close()
+			return
+		}
+		log.DefaultLogger.Debug("Received NATS Message")
+		// extend the TTL every time we receive a message.
+		ds.streamResponsesSoFar.Touch(requestUuid)
+		messages++
+
+		frame, err := goja.ConvertMessage(nc, msg, qm.JsFn)
+		if err != nil {
+			err = fmt.Errorf("could not convert message %d: %w", messages, err)
+			log.DefaultLogger.Error(err.Error())
+			if !handOver(firstResult{err: err}) {
+				sr.notify(nil, err)
+			}
+			// a broken script will not fix itself on the next message, so stop here.
+			sr.close()
+			return
+		}
+
+		if handOver(firstResult{frame: frame}) {
+			return
+		}
+		sr.notify(frame, nil)
+	})
 	if err != nil {
+		cancel()
 		return backend.ErrDataResponse(backend.StatusBadRequest, "could not create subscription: "+err.Error())
 	}
+	sr.setSubscription(subscription)
+	ds.streamResponsesSoFar.Set(requestUuid, sr, ds.streamTTL)
 	log.DefaultLogger.Debug(fmt.Sprintf("%s: Subscription set up for %s", requestUuid, qm.NatsSubject))
-	sr.subscribed = true
 
-	// wait until the 1st NATS message was received
-	wg.Wait()
-
-	log.DefaultLogger.Debug(fmt.Sprintf("Finished waiting"))
-	if sr.currentErr != nil {
-		return backend.ErrDataResponse(backend.StatusBadRequest, "error handling 1st message: "+sr.currentErr.Error())
-	}
-
+	// Grafana reaches the live channel via the frame's metadata.
 	channel := live.Channel{
 		Scope:     live.ScopeDatasource,
 		Namespace: ds.uid,
-		Path:      requestUuid, // because request UUID is random, we cannot snoop on other people's values (security). and we have one subscription per user (which is what we want in our case)
+		// because the request UUID is random, we cannot snoop on other people's values (security),
+		// and we have one subscription per user (which is what we want in our case).
+		Path: requestUuid,
 	}
-	firstFrame.SetMeta(&data.FrameMeta{Channel: channel.String()})
-	return backend.DataResponse{
-		Frames: data.Frames{
-			firstFrame,
-		},
-		Status: backend.StatusOK,
+	meta := &data.FrameMeta{Channel: channel.String()}
+
+	// Wait for the first message, but no longer than the request timeout: on a quiet subject this
+	// request would otherwise block forever, leaking this goroutine and the subscription with it.
+	timeout := time.NewTimer(qm.RequestTimeout.Duration)
+	defer timeout.Stop()
+
+	select {
+	case result := <-first:
+		if result.err != nil {
+			ds.streamResponsesSoFar.Delete(requestUuid)
+			return backend.ErrDataResponse(backend.StatusBadRequest, "error handling 1st message: "+result.err.Error())
+		}
+		result.frame.SetMeta(meta)
+		return backend.DataResponse{
+			Frames: data.Frames{result.frame},
+			Status: backend.StatusOK,
+		}
+
+	case <-timeout.C:
+		// No message so far. Hand Grafana an empty frame on the live channel, so that the panel
+		// subscribes and fills up once messages start arriving. Anything that arrives from here on
+		// reaches the panel through the stream instead.
+		log.DefaultLogger.Debug(fmt.Sprintf("%s: no message on %s within %s, streaming anyway",
+			requestUuid, qm.NatsSubject, qm.RequestTimeout.Duration))
+		frame := data.NewFrame("response")
+		frame.SetMeta(meta)
+		return backend.DataResponse{
+			Frames: data.Frames{frame},
+			Status: backend.StatusOK,
+		}
+
+	case <-ctx.Done():
+		// the query was cancelled, f.e. because the dashboard was closed while we were waiting.
+		ds.streamResponsesSoFar.Delete(requestUuid)
+		return backend.ErrDataResponse(backend.StatusBadRequest, "query cancelled: "+ctx.Err().Error())
 	}
 }
 
