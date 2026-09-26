@@ -117,6 +117,35 @@ Supported Return values: A map `{k: "v"}` (because the results are *streamed* to
 
 
 
+## Binary payloads and MessagePack
+
+`msg.Data` is the payload decoded as UTF-8. That is convenient for JSON and text, but **lossy for
+binary payloads**, because invalid UTF-8 bytes are replaced by U+FFFD. For binary data use:
+
+- `msg.RawData` - a `Uint8Array` with the exact bytes. Writing to `msg.Data` or `msg.RawData` accepts
+  a string (UTF-8 encoded), an `ArrayBuffer`, a typed array or a `DataView`.
+- `entry.rawValue` - the same for a Key/Value entry.
+- `msgpack.decode(bytes)` - decodes a [MessagePack](https://msgpack.org/) payload, a common format
+  for NATS clients (f.e. .NET ones). It takes a `Uint8Array`, an `ArrayBuffer` or a string.
+
+```js
+// read a MessagePack payload instead of JSON
+const value = msgpack.decode(msg.RawData);
+return {name: value.Name, count: value.Count};
+```
+
+`msgpack.decode` maps MessagePack to JS as follows:
+
+| MessagePack | JavaScript |
+| --- | --- |
+| nil / bool / int / float / str | `null`, boolean, number, string |
+| bin | `Uint8Array` |
+| array / map | `Array` / object (non-string keys become strings) |
+| timestamp (ext -1) | `Date`, which Grafana renders as a time field |
+| other extensions | `{type, data}` with `data` as a `Uint8Array` |
+
+Note that JS numbers are float64, so integers beyond 2^53 lose precision.
+
 ## Key/Value Mode explained
 
 Reads the entries of a [JetStream Key/Value](https://docs.nats.io/nats-concepts/jetstream/key-value-store) bucket -
@@ -233,6 +262,9 @@ Input: `nc` the [nats.Conn](https://pkg.go.dev/github.com/nats-io/nats.go#Conn) 
 - [nc.Request()](https://pkg.go.dev/github.com/nats-io/nats.go#Conn.Request) for sending out a request, and listening
   to a response
 - any other interaction with the Go API.
+
+`msgpack.decode(bytes)` decodes a MessagePack payload - see
+[Binary payloads and MessagePack](#binary-payloads-and-messagepack).
 
 `kv("bucket")` gives access to a JetStream Key/Value bucket:
 

@@ -66,6 +66,14 @@ func KVEntries(ctx context.Context, kv jetstream.KeyValue, filter string, includ
 	}
 }
 
+// kvEntryToJSMap is like KVEntryToMap, but additionally contains the raw value as rawValue,
+// which is converted to a Uint8Array by _wrapKVEntry in JS.
+func kvEntryToJSMap(entry jetstream.KeyValueEntry) map[string]interface{} {
+	m := KVEntryToMap(entry)
+	m["rawValue"] = entry.Value()
+	return m
+}
+
 // kvBucketW is the KV bucket API exposed to JS as kv("bucket"). Every call is bounded by timeout.
 type kvBucketW struct {
 	kv      jetstream.KeyValue
@@ -83,7 +91,7 @@ func (b *kvBucketW) Get(key string) (map[string]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	return KVEntryToMap(entry), nil
+	return kvEntryToJSMap(entry), nil
 }
 
 // Keys returns all keys matching filter (f.e. "foo.>"; empty means all keys).
@@ -123,7 +131,7 @@ func (b *kvBucketW) entries(filter string, includeHistory bool) ([]interface{}, 
 	}
 	result := make([]interface{}, len(entries))
 	for i, entry := range entries {
-		result[i] = KVEntryToMap(entry)
+		result[i] = kvEntryToJSMap(entry)
 	}
 	return result, nil
 }
@@ -145,8 +153,9 @@ func kvFn(nc *nats.Conn, timeout time.Duration) func(bucket string) (*kvBucketW,
 	}
 }
 
-// ConvertKVEntry runs jsFn for a single KV entry (available as "entry" in JS) and returns the resulting row.
-func ConvertKVEntry(nc *nats.Conn, entry map[string]interface{}, jsFn string) (map[string]interface{}, error) {
+// ConvertKVEntry runs jsFn for a single KV entry (available as "entry" in JS, with rawValue being the raw bytes)
+// and returns the resulting row.
+func ConvertKVEntry(nc *nats.Conn, entry map[string]interface{}, rawValue []byte, jsFn string) (map[string]interface{}, error) {
 	vm := gojaPool.Get().(*goja.Runtime)
 	defer gojaPool.Put(vm)
 	if err := vm.Set("__nc", nc); err != nil {
@@ -155,10 +164,14 @@ func ConvertKVEntry(nc *nats.Conn, entry map[string]interface{}, jsFn string) (m
 	if err := vm.Set("__entry", entry); err != nil {
 		return nil, err
 	}
+	if err := vm.Set("__entryRaw", rawValue); err != nil {
+		return nil, err
+	}
 	// reset request-scoped variables - this way, we can have a clean VM again.
 	defer func() {
 		_ = vm.GlobalObject().Delete("__nc")
 		_ = vm.GlobalObject().Delete("__entry")
+		_ = vm.GlobalObject().Delete("__entryRaw")
 	}()
 
 	resultWrapper, err := vm.RunString(wrapJsKVEntry(jsFn))
@@ -178,7 +191,7 @@ func wrapJsKVEntry(in string) string {
 	"use strict";
 	(function() {
 		const {nats, nc} = _setup(_nats, _bytesToStr, _strToBytes, _parseDuration)(__nc, undefined);
-		const entry = __entry;
+		const entry = _wrapKVEntry(__entry, __entryRaw);
 		%s;
     })()
 `, in)

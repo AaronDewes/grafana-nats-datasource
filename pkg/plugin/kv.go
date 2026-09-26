@@ -37,7 +37,7 @@ func (ds *Datasource) kv(ctx context.Context, qm queryModel, nc *nats.Conn) back
 	for _, entry := range entries {
 		row := goja.KVEntryToMap(entry)
 		if qm.JsFn != "" {
-			row, err = goja.ConvertKVEntry(nc, row, qm.JsFn)
+			row, err = goja.ConvertKVEntry(nc, row, entry.Value(), qm.JsFn)
 			if err != nil {
 				return backend.ErrDataResponse(backend.StatusBadRequest, "could not convert KV entry "+entry.Key()+": "+err.Error())
 			}

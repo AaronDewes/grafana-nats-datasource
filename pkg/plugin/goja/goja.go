@@ -17,8 +17,11 @@ import (
 // They have a _setup function defined (see setupFn), which wraps the NATS api and smoothens
 // incompatibilities between JS and Golang:
 //
-// - Msg.Data in NATS is a []byte, but in JS we only know about strings.
-// - Timeouts are accepted as strings and auto-converted.
+//   - Msg.Data in NATS is a []byte. In JS, msg.Data is the UTF-8 decoded string (lossy for binary data),
+//     and msg.RawData is a Uint8Array with the exact bytes. Data sent to NATS can be a string
+//     (UTF-8 encoded), an ArrayBuffer, or any typed array / DataView.
+//   - Timeouts are accepted as strings and auto-converted.
+//   - msgpack.decode() decodes MessagePack payloads, which cannot be read via msg.Data.
 //
 // JS variables starting with "_" are internal, and are immutable. JS Variables
 // starting with "__" are request-scoped.
@@ -34,12 +37,17 @@ var gojaPool = sync.Pool{
 		vm.Set("_strToBytes", func(in string) []byte {
 			return []byte(in)
 		})
-		vm.Set("_strToBytes", func(in string) []byte {
-			return []byte(in)
+		vm.Set("_bytesToBuffer", func(in []byte) goja.ArrayBuffer {
+			// copy, so that modifications in JS do not change the original message.
+			return vm.NewArrayBuffer(append([]byte{}, in...))
+		})
+		vm.Set("_bufferToBytes", func(in goja.ArrayBuffer) []byte {
+			return append([]byte{}, in.Bytes()...)
 		})
 		vm.Set("_parseDuration", func(in string) (time.Duration, error) {
 			return time.ParseDuration(in)
 		})
+		vm.Set("msgpack", newMsgpackObject(vm))
 		vm.Set("_nats", &natsW{
 			NewInbox: nats.NewInbox,
 			Context:  nats.Context,
@@ -62,17 +70,61 @@ type natsW struct {
 // setupFn is the JS setup function registered during construction of Goja. See gojaPool for details.
 const setupFn = `
 "use strict";
+
+// converts data to be sent to NATS to []byte: strings are UTF-8 encoded,
+// ArrayBuffers, typed arrays and DataViews are used as-is.
+function _toBytes(data) {
+    if (data instanceof ArrayBuffer) {
+        return _bufferToBytes(data);
+    }
+    if (ArrayBuffer.isView(data)) {
+        return _bufferToBytes(new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice().buffer);
+    }
+    if (data === undefined || data === null) {
+        return _strToBytes("");
+    }
+    return _strToBytes(String(data));
+}
+
+// converts a KV entry map from Go into a JS object, with rawValue being a Uint8Array.
+// rawValue is not enumerable, so that it is not rendered if the entry is returned as a row.
+function _wrapKVEntry(__entry, __raw) {
+    if (!__entry) {
+        // keep falsy objects
+        return __entry;
+    }
+    const entry = {};
+    for (const k of ["key", "value", "revision", "created", "operation"]) {
+        entry[k] = __entry[k];
+    }
+    Object.defineProperty(entry, "rawValue", {
+        get() {
+            return new Uint8Array(_bytesToBuffer(__raw === undefined ? __entry.rawValue : __raw));
+        }
+    });
+    return entry;
+}
+
+function _wrapKVBucket(__bucket) {
+    const bucket = Object.create(__bucket);
+    bucket.Get = (key) => _wrapKVEntry(__bucket.Get(key));
+    bucket.Entries = (filter) => Array.from(__bucket.Entries(filter), (e) => _wrapKVEntry(e));
+    bucket.History = (filter) => Array.from(__bucket.History(filter), (e) => _wrapKVEntry(e));
+    bucket.Keys = (filter) => Array.from(__bucket.Keys(filter));
+    return bucket;
+}
+
 function _setup(_nats, _bytesToStr, _strToBytes, _parseDuration) {
     function wrapNc(__nc) {
         const nc = Object.create(__nc);
         
-        nc.Publish = (subj, data) => __nc.Publish(subj, _strToBytes(data));
-        nc.PublishRequest = (subj, reply, data) => __nc.PublishRequest(subj, reply, _strToBytes(data));
+        nc.Publish = (subj, data) => __nc.Publish(subj, _toBytes(data));
+        nc.PublishRequest = (subj, reply, data) => __nc.PublishRequest(subj, reply, _toBytes(data));
         nc.QueueSubscribe = (subj, queue, cb) => wrapSubscription(__nc.QueueSubscribe(subj, queue, (__msg) => cb(wrapMsg(__msg))));
         nc.QueueSubscribeSync = (subj, queue) => wrapSubscription(__nc.QueueSubscribeSync(subj, queue));
-        nc.Request = (subj, data, timeout) => wrapMsg(__nc.Request(subj, _strToBytes(data), _parseDuration(timeout)));
+        nc.Request = (subj, data, timeout) => wrapMsg(__nc.Request(subj, _toBytes(data), _parseDuration(timeout)));
         nc.RequestMsg = (msg, timeout) => wrapMsg(__nc.RequestMsg(msg, _parseDuration(timeout)));
-        nc.RequestWithContext = (ctx, subj, data) => wrapMsg(__nc.RequestWithContext(ctx, subj, _strToBytes(data)));
+        nc.RequestWithContext = (ctx, subj, data) => wrapMsg(__nc.RequestWithContext(ctx, subj, _toBytes(data)));
         nc.Subscribe = (subj, cb) => wrapSubscription(__nc.Subscribe(subj, (__msg) => cb(wrapMsg(__msg))));
         nc.SubscribeSync = (subj) => wrapSubscription(__nc.SubscribeSync(subj));
 		return nc;
@@ -89,7 +141,15 @@ function _setup(_nats, _bytesToStr, _strToBytes, _parseDuration) {
 				return _bytesToStr(__msg.Data);
 			},
 			set(value) {
-                __msg.Data = _strToBytes(value);
+                __msg.Data = _toBytes(value);
+			}
+		});
+		Object.defineProperty(msg, "RawData", {
+			get() {
+				return new Uint8Array(_bytesToBuffer(__msg.Data));
+			},
+			set(value) {
+                __msg.Data = _toBytes(value);
 			}
 		});
 		return msg;
@@ -156,7 +216,7 @@ func wrapJsScript(in string) string {
 	"use strict";
 	(function() {
 		const {nats, nc} = _setup(_nats, _bytesToStr, _strToBytes, _parseDuration)(__nc, undefined);
-		const kv = __kv;
+		const kv = (bucket) => _wrapKVBucket(__kv(bucket));
 		%s;
     })()
 `, in)

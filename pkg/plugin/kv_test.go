@@ -14,8 +14,8 @@ import (
 	"github.com/sandstormmedia/nats/pkg/plugin/goja"
 )
 
-// startKVServer starts an in-process NATS server with JetStream and a "config" KV bucket.
-func startKVServer(t *testing.T) *nats.Conn {
+// startNatsServer starts an in-process NATS server with JetStream enabled.
+func startNatsServer(t *testing.T) *nats.Conn {
 	t.Helper()
 	ns, err := server.NewServer(&server.Options{Port: -1, JetStream: true, StoreDir: t.TempDir()})
 	if err != nil {
@@ -33,6 +33,13 @@ func startKVServer(t *testing.T) *nats.Conn {
 	}
 	t.Cleanup(nc.Close)
 
+	return nc
+}
+
+// startKVServer starts an in-process NATS server with a seeded "config" KV bucket.
+func startKVServer(t *testing.T) *nats.Conn {
+	t.Helper()
+	nc := startNatsServer(t)
 	ctx := context.Background()
 	js, _ := jetstream.New(nc)
 	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: "config", History: 5})
