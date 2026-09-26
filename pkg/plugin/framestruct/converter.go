@@ -241,8 +241,7 @@ func (c *converter) upsertField(v reflect.Value, fieldName string) error {
 	}
 
 	c.padField(c.fields[fieldName], c.maxLen-1)
-	c.appendToField(fieldName, toPointer(valueOf))
-	return nil
+	return c.appendToField(fieldName, toPointer(valueOf))
 }
 
 func (c *converter) convertField(v reflect.Value, fieldName string) (interface{}, error) {
@@ -256,13 +255,43 @@ func (c *converter) convertField(v reflect.Value, fieldName string) (interface{}
 	return v.Interface(), nil
 }
 
-func (c *converter) appendToField(name string, value interface{}) {
-	c.fields[name].Append(value)
+func (c *converter) appendToField(name string, value interface{}) error {
+	field := c.fields[name]
+	// JSON numbers from JavaScript are exported as int64 if they have no fractional part (f.e. 22.0),
+	// and as float64 otherwise - so a single column may contain both. Widen such columns to float64.
+	switch v := value.(type) {
+	case *int64:
+		if field.Type() == data.FieldTypeNullableFloat64 {
+			f := float64(*v)
+			value = &f
+		}
+	case *float64:
+		if field.Type() == data.FieldTypeNullableInt64 {
+			field = widenToFloat64(field)
+			c.fields[name] = field
+		}
+	}
+	if data.FieldTypeFor(value) != field.Type() {
+		return fmt.Errorf("field %s: cannot mix values of type %s and %T", name, field.Type().ItemTypeString(), value)
+	}
+	field.Append(value)
 	// SK BUGFIX START
 	/*if c.fields[name].Len() > c.maxLen {
 		c.maxLen++
 	}*/
 	// SK BUGFIX END
+	return nil
+}
+
+func widenToFloat64(field *data.Field) *data.Field {
+	values := make([]*float64, field.Len())
+	for i := range values {
+		if v := field.At(i).(*int64); v != nil {
+			f := float64(*v)
+			values[i] = &f
+		}
+	}
+	return data.NewField(field.Name, field.Labels, values)
 }
 
 func (c *converter) createFrame(name string) *data.Frame {

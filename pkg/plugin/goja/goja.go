@@ -156,6 +156,7 @@ func wrapJsScript(in string) string {
 	"use strict";
 	(function() {
 		const {nats, nc} = _setup(_nats, _bytesToStr, _strToBytes, _parseDuration)(__nc, undefined);
+		const kv = __kv;
 		%s;
     })()
 `, in)
@@ -190,7 +191,8 @@ func ConvertMessage(nc *nats.Conn, msg *nats.Msg, jsFn string) (*data.Frame, err
 	return convertResult(result)
 }
 
-func RunScript(nc *nats.Conn, jsFn string) (*data.Frame, error) {
+// RunScript runs a free-form script. timeout bounds each KV operation of the script.
+func RunScript(nc *nats.Conn, jsFn string, timeout time.Duration) (*data.Frame, error) {
 	if jsFn == "" {
 		return nil, fmt.Errorf("script must be specified")
 	}
@@ -199,9 +201,13 @@ func RunScript(nc *nats.Conn, jsFn string) (*data.Frame, error) {
 	if err := vm.Set("__nc", nc); err != nil {
 		return nil, err
 	}
+	if err := vm.Set("__kv", kvFn(nc, timeout)); err != nil {
+		return nil, err
+	}
 	// reset request-scoped variables - this way, we can have a clean VM again.
 	defer func() {
 		_ = vm.GlobalObject().Delete("__nc")
+		_ = vm.GlobalObject().Delete("__kv")
 	}()
 
 	resultWrapper, err := vm.RunString(wrapJsScript(jsFn))

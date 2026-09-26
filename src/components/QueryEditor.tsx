@@ -1,5 +1,5 @@
 import React, {PureComponent} from 'react';
-import {Alert, ButtonCascader, CascaderOption, Field, FieldSet, Input, RadioButtonGroup} from '@grafana/ui';
+import {Alert, ButtonCascader, CascaderOption, Field, FieldSet, Input, RadioButtonGroup, Switch} from '@grafana/ui';
 import {
     QueryEditorProps
 } from '@grafana/data';
@@ -12,6 +12,13 @@ type Props = QueryEditorProps<DataSource, MyQuery, MyDataSourceOptions>;
 function onChange(props: Props, fieldName: string) {
     return (event: React.SyntheticEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => {
         props.onChange({...props.query, [fieldName]: event.currentTarget.value});
+        props.onRunQuery();
+    }
+}
+
+function onChangeBool(props: Props, fieldName: string) {
+    return (event: React.FormEvent<HTMLInputElement>) => {
+        props.onChange({...props.query, [fieldName]: event.currentTarget.checked});
         props.onRunQuery();
     }
 }
@@ -31,7 +38,7 @@ function onQueryTypeChange<TVal>(props: Props, fieldName: string) {
     }
 }
 
-type SCRIPT_IDS = "default" | "headers" | "scripting_multipleRequests" | "scripting_multipleResponses";
+type SCRIPT_IDS = "default" | "headers" | "kv_json" | "kv_number" | "scripting_multipleRequests" | "scripting_multipleResponses" | "scripting_kv";
 
 const scripts: {  [prop in SCRIPT_IDS]: string} = {
     default: `
@@ -48,6 +55,15 @@ const scripts: {  [prop in SCRIPT_IDS]: string} = {
         row["otherHeader"] = msg.Header.Get("My-Header")    
         
         return row
+    `,
+    kv_json: `
+        // entry contains key, value (as string), revision, created and operation.
+        // Here, the JSON value is expanded into columns, next to the key and creation time.
+        return Object.assign({key: entry.key, created: entry.created}, JSON.parse(entry.value));
+    `,
+    kv_number: `
+        // For numeric values - f.e. to draw a time series together with "Include history".
+        return {created: entry.created, [entry.key]: Number(entry.value)};
     `,
     scripting_multipleRequests: `
         // do two requests on different NATS subjects (json1 and json2)
@@ -87,6 +103,20 @@ const scripts: {  [prop in SCRIPT_IDS]: string} = {
           delete parsed.statsz.routes;
           result.push(parsed);
     }
+    `,
+    scripting_kv: `
+        // kv("bucket") gives access to a JetStream Key/Value bucket:
+        // - Get(key) returns the entry {key, value, revision, created, operation}, or null if the key does not exist.
+        // - Keys(filter) returns the keys matching the filter (f.e. "sensors.>", "" for all keys).
+        // - Entries(filter) returns the latest entry of all matching keys.
+        // - History(filter) returns all revisions of all matching keys.
+        const bucket = kv("config");
+        const result = [];
+        for (const key of bucket.Keys("")) {
+            const entry = bucket.Get(key);
+            result.push({key: key, value: entry.value, revision: entry.revision});
+        }
+        return result;
     `
 };
 
@@ -168,6 +198,40 @@ function explanationForQueryType(queryType: QueryTypes): { title: string, conten
 
         };
     }
+    if (queryType === "KV") {
+        return {
+            title: 'Key/Value mode explained',
+            content: <>
+                <p>Reads the entries of a <a href="https://docs.nats.io/nats-concepts/jetstream/key-value-store"
+                    target="_blank" rel="noreferrer">JetStream Key/Value</a> bucket - one row per key, with the
+                    columns <code>key</code>, <code>value</code>, <code>revision</code>, <code>created</code> and
+                    <code>operation</code>. Deleted keys are skipped.</p>
+
+                <p>With <em>Include history</em>, all stored revisions are returned (oldest first) instead of only
+                    the latest value - useful to draw a key's value over time.</p>
+
+                <p>You can post-process each entry via JavaScript.</p>
+            </>,
+            mapFnLabel: 'Entry Mapping JavaScript',
+            mapFnDescription: <>
+                Input: <code>entry</code> contains the KV entry as <code>{'{key, value, revision, created, operation}'}</code>,
+                where <code>value</code> is a string.<br/>
+                Supported Return values: A map <code>{'{k: "v"}'}</code>.
+            </>,
+            mapFnExamples: [
+                {
+                    label: 'JSON values',
+                    title: 'expand JSON values into columns',
+                    value: "kv_json" as "kv_json"
+                },
+                {
+                    label: 'numeric values',
+                    title: 'one numeric column per key, f.e. for a time series',
+                    value: "kv_number" as "kv_number"
+                }
+            ]
+        };
+    }
     if (queryType === "SCRIPT") {
         return {
             title: 'Script mode explained',
@@ -194,6 +258,7 @@ function explanationForQueryType(queryType: QueryTypes): { title: string, conten
                     <a href="https://pkg.go.dev/github.com/nats-io/nats.go#Conn.Subscribe">nc.Subscribe()</a>,
                     <a href="https://pkg.go.dev/github.com/nats-io/nats.go#Conn.Request">nc.Request()</a><br/> (or any
                     other interaction).<br/>
+                    <code>kv("bucket")</code> gives access to a Key/Value bucket (see the example code).<br/>
                     Supported Return values: <a href="https://pkg.go.dev/github.com/grafana/grafana-plugin-sdk-go@v0.147.0/data#Frame"
                     target="_blank" rel="noreferrer">data.Frame</a> or an error.
                 </>,
@@ -208,6 +273,11 @@ function explanationForQueryType(queryType: QueryTypes): { title: string, conten
                     title: 'a request which triggers multiple responses',
                     value: "scripting_multipleResponses" as "scripting_multipleResponses"
 
+                },
+                {
+                    label: 'Key/Value bucket',
+                    title: 'read keys and values of a Key/Value bucket',
+                    value: "scripting_kv" as "scripting_kv"
                 }
             ]
 
@@ -254,6 +324,30 @@ export class QueryEditor extends PureComponent<Props> {
                             onChange={onChange(this.props, 'natsSubject')}
                         />
                     </Field>
+                    : undefined}
+                {query.queryType === "KV" ?
+                    <>
+                        <Field label="Bucket" description="the name of the Key/Value bucket">
+                            <Input
+                                className="width-27"
+                                value={query.kvBucket}
+                                onChange={onChange(this.props, 'kvBucket')}
+                            />
+                        </Field>
+                        <Field label="Key" description="the key to read - wildcards are allowed, f.e. sensors.>. Leave empty for all keys.">
+                            <Input
+                                className="width-27"
+                                value={query.kvKey}
+                                onChange={onChange(this.props, 'kvKey')}
+                            />
+                        </Field>
+                        <Field label="Include history" description="return all stored revisions instead of only the latest value">
+                            <Switch
+                                value={query.kvHistory ?? false}
+                                onChange={onChangeBool(this.props, 'kvHistory')}
+                            />
+                        </Field>
+                    </>
                     : undefined}
                 <Field label="Request Timeout">
                     <Input

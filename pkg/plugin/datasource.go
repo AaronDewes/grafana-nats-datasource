@@ -210,6 +210,8 @@ func (ds *Datasource) query(ctx context.Context, pCtx backend.PluginContext, que
 		return ds.subscribe(ctx, qm, nc)
 	} else if qm.QueryType == QueryTypeScript {
 		return ds.script(ctx, qm, nc)
+	} else if qm.QueryType == QueryTypeKV {
+		return ds.kv(ctx, qm, nc)
 	} else {
 		return backend.ErrDataResponse(backend.StatusBadRequest, "Invalid Query Type: "+qm.QueryType)
 	}
@@ -368,7 +370,7 @@ func (ds *Datasource) subscribe(_ context.Context, qm queryModel, nc *nats.Conn)
 // script allows free-form scripts
 // TODO explain how done
 func (ds *Datasource) script(_ context.Context, qm queryModel, natsConn *nats.Conn) backend.DataResponse {
-	frame, err := goja.RunScript(natsConn, qm.JsFn)
+	frame, err := goja.RunScript(natsConn, qm.JsFn, qm.RequestTimeout.Duration)
 
 	if err != nil {
 		return backend.ErrDataResponse(backend.StatusBadRequest, "error handling 1st message: "+err.Error())

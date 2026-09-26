@@ -13,6 +13,9 @@ Features:
 - **Subscribe:** Listen to a certain topic, and visualize the messages as they stream into the system.
    - The messages can be post-processed if needed via JavaScript.
    - This is useful if you have a stream of continuous data (f.e. Logs) and you want to use them as they arrive.
+- **Key/Value:** Read the entries of a JetStream Key/Value bucket, optionally including their history.
+   - The entries can be post-processed if needed via JavaScript.
+   - This is useful to show configuration or state stored in KV, or to chart a key's value over time.
 - **Free-Form Script:** This is an advanced mode, which can send **multiple NATS requests**, wait for **multiple responses**
   and do **any kind of processing**. See below for examples.
 - A default **Dashboard** which shows NATS system metrics via the `$SYS` account.
@@ -114,6 +117,42 @@ Supported Return values: A map `{k: "v"}` (because the results are *streamed* to
 
 
 
+## Key/Value Mode explained
+
+Reads the entries of a [JetStream Key/Value](https://docs.nats.io/nats-concepts/jetstream/key-value-store) bucket -
+one row per key, with the columns `key`, `value`, `revision`, `created` and `operation`. Deleted keys are skipped.
+
+- **Bucket:** the name of the bucket.
+- **Key:** the key to read. Wildcards are allowed (f.e. `sensors.>`); leave empty for all keys.
+- **Include history:** return all stored revisions (oldest first) instead of only the latest value.
+
+You can post-process each entry via JavaScript, for example:
+
+**JSON values**
+
+```js
+// entry contains key, value (as string), revision, created and operation.
+// Here, the JSON value is expanded into columns, next to the key and creation time.
+return Object.assign({key: entry.key, created: entry.created}, JSON.parse(entry.value));
+```
+
+**Numeric values** (f.e. to draw a time series together with *Include history*)
+
+```js
+return {created: entry.created, [entry.key]: Number(entry.value)};
+```
+
+For live updates, use the *Subscribe* mode on `$KV.<bucket>.>` - every change of a key is published on that subject.
+Deletes arrive with an empty payload and the header `KV-Operation: DEL`.
+
+### Scripting API
+
+Input: `entry` contains the KV entry as `{key, value, revision, created, operation}`, where `value` is a string.
+
+Supported Return values: A map `{k: "v"}`.
+
+
+
 ## Free-Form Script (advanced) explained
 
 For advanced use cases, a free-form script can be used, which directly controls how messages
@@ -174,6 +213,18 @@ while(true) {
 }
 ```
 
+**Key/Value bucket**
+
+```js
+const bucket = kv("config");
+const result = [];
+for (const key of bucket.Keys("")) {
+    const entry = bucket.Get(key);
+    result.push({key: key, value: entry.value, revision: entry.revision});
+}
+return result;
+```
+
 ### Scripting API
 
 Input: `nc` the [nats.Conn](https://pkg.go.dev/github.com/nats-io/nats.go#Conn) you can use to:
@@ -182,6 +233,15 @@ Input: `nc` the [nats.Conn](https://pkg.go.dev/github.com/nats-io/nats.go#Conn) 
 - [nc.Request()](https://pkg.go.dev/github.com/nats-io/nats.go#Conn.Request) for sending out a request, and listening
   to a response
 - any other interaction with the Go API.
+
+`kv("bucket")` gives access to a JetStream Key/Value bucket:
+
+- `Get(key)` returns the entry `{key, value, revision, created, operation}`, or `null` if the key does not exist;
+- `Keys(filter)` returns the keys matching the filter (f.e. `"sensors.>"`, `""` for all keys);
+- `Entries(filter)` returns the latest entry of all matching keys;
+- `History(filter)` returns all revisions of all matching keys.
+
+Each KV call is bounded by the *Request Timeout*.
 
 Supported Return values: A map `{k: "v"}`, a list of maps `[{k: "v"}]`,
 a [data.Frame](https://pkg.go.dev/github.com/grafana/grafana-plugin-sdk-go@v0.147.0/data#Frame).

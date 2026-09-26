@@ -27,6 +27,7 @@ type MySecureJsonData struct {
 const QueryTypeRequestReply = "REQUEST_REPLY"
 const QueryTypeSubscribe = "SUBSCRIBE"
 const QueryTypeScript = "SCRIPT"
+const QueryTypeKV = "KV"
 
 type queryModel struct {
 	QueryType                   string   `json:"queryType"`
@@ -34,6 +35,9 @@ type queryModel struct {
 	RequestTimeout              Duration `json:"requestTimeout"`
 	RequestData                 string   `json:"requestData"`
 	JsFn                        string   `json:"jsFn"`
+	KvBucket                    string   `json:"kvBucket"`
+	KvKey                       string   `json:"kvKey"`
+	KvHistory                   bool     `json:"kvHistory"`
 	StreamRequestUuidForTesting string   `json:"testing_streamRequestUuid"` // for deterministic tests only
 }
 

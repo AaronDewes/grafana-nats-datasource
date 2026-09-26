@@ -1,14 +1,20 @@
 import {DataQuery, DataSourceJsonData, SelectableValue} from '@grafana/data';
 // These need to be synced with types.go
 
-export type QueryTypes = "REQUEST_REPLY" | "SUBSCRIBE" | "SCRIPT";
+export type QueryTypes = "REQUEST_REPLY" | "SUBSCRIBE" | "SCRIPT" | "KV";
 export interface MyQuery extends DataQuery {
     queryType: QueryTypes;
     natsSubject: string;
     requestTimeout: string;
     requestData: string;
 
+    // for KV only
+    kvBucket?: string;
+    kvKey?: string;
+    kvHistory?: boolean;
+
     // for REQUEST_REPLY and SUBSCRIBE, gets each individual message and can transform it.
+    // for KV, gets each individual entry and can transform it.
     // for SCRIPT, can take control of any flow.
     jsFn: string;
 }
@@ -23,6 +29,11 @@ export const QueryTypeOptions: Array<SelectableValue<QueryTypes>> = [
         label: "Subscribe",
         value: "SUBSCRIBE",
         description: "Subscribe to a topic (wildcards allowed), and render them in a streaming fashion"
+    },
+    {
+        label: "Key/Value",
+        value: "KV",
+        description: "Read the entries of a JetStream Key/Value bucket, optionally including their history."
     },
     {
         label: "Free-Form Script (advanced)",
