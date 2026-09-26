@@ -198,6 +198,6 @@ a [data.Frame](https://pkg.go.dev/github.com/grafana/grafana-plugin-sdk-go@v0.14
 # to hot-reload the plugin:
 ./dev.sh reload-plugin
 
-./dev.sh test-nats-server 
+./dev.sh test-nats-server
 ```
 
