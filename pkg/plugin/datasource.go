@@ -35,7 +35,6 @@ var (
 func NewDatasource(ctx context.Context, config backend.DataSourceInstanceSettings) (instancemgmt.Instance, error) {
 	return &Datasource{
 		uid:                  config.UID,
-		natsConnOnce:         &sync.Once{},
 		streamResponsesSoFar: ttlcache.New[string, *streamResponse](),
 	}, nil
 }
@@ -45,6 +44,7 @@ func NewDatasource(ctx context.Context, config backend.DataSourceInstanceSetting
 // be disposed and a new one will be created using NewSampleDatasource factory function.
 func (ds *Datasource) Dispose() {
 	// Clean up datasource instance resources.
+	ds.closeNats()
 }
 
 // Datasource is an example datasource which can respond to data queries, reports
@@ -53,12 +53,10 @@ type Datasource struct {
 	uid                  string
 	streamResponsesSoFar *ttlcache.Cache[string, *streamResponse]
 
-	// natsConnOnce is implementation detail of connectNats to ensure we only create one NATS connection without any race conditions
-	natsConnOnce *sync.Once
+	// natsConnMu guards natsConn, so that only one NATS connection is created without any race conditions
+	natsConnMu sync.Mutex
 	// natsConn contains the singleton NATS connection for the datasource. Never access this directly, but always use connectNats.
 	natsConn *nats.Conn
-	// natsConnErr contains the error if creating the NATS connection failed. Never access this directly, but always use connectNats.
-	natsConnErr error
 }
 
 type streamResponse struct {
@@ -240,14 +238,14 @@ func (ds *Datasource) CheckHealth(_ context.Context, req *backend.CheckHealthReq
 	//////////////
 	// 2) Connect
 	//////////////
-	natsConn, err := ds.connectNats(dataSourceOptions, dataSourceSecureOptions)
+	_, err = ds.connectNats(dataSourceOptions, dataSourceSecureOptions)
 	if err != nil {
 		return &backend.CheckHealthResult{
 			Status:  backend.HealthStatusError,
 			Message: "NATS could not be connected to: " + err.Error(),
 		}, nil
 	}
-	natsConn.Close()
+	// NOTE: do not close the connection here - it is shared with all queries of this datasource.
 
 	return &backend.CheckHealthResult{
 		Status:  backend.HealthStatusOk,
