@@ -7,7 +7,13 @@ import {DataSource} from '../datasource';
 import {MyDataSourceOptions, MyQuery, QueryTypeOptions, QueryTypes} from '../types';
 import {JavaScriptCodeEditorField} from "./JavaScriptCodeEditorField";
 
-type Props = QueryEditorProps<DataSource, MyQuery, MyDataSourceOptions>;
+type Props = QueryEditorProps<DataSource, MyQuery, MyDataSourceOptions> & {
+    /**
+     * Restricts the offered query types. Grafana does not set this; it is used by the annotation
+     * editor, which cannot use every query type.
+     */
+    availableQueryTypes?: QueryTypes[];
+};
 
 function onChange(props: Props, fieldName: string) {
     return (event: React.SyntheticEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => {
@@ -301,13 +307,17 @@ function explanationForQueryType(queryType: QueryTypes): { title: string, conten
 export class QueryEditor extends PureComponent<Props> {
     render() {
         const query = this.props.query;
+        const availableQueryTypes = this.props.availableQueryTypes;
+        const queryTypeOptions = availableQueryTypes
+            ? QueryTypeOptions.filter((option) => availableQueryTypes.includes(option.value!))
+            : QueryTypeOptions;
 
         const explanation = explanationForQueryType(query.queryType);
         return (
             <FieldSet>
                 <Field label="Query Type" description="How do we interact with the NATS system">
                     <RadioButtonGroup<QueryTypes>
-                        options={QueryTypeOptions}
+                        options={queryTypeOptions}
                         value={query.queryType}
                         onChange={onQueryTypeChange(this.props, 'queryType')}
                     />

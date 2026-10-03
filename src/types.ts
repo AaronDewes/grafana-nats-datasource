@@ -47,6 +47,25 @@ export const DEFAULT_QUERY: Partial<MyQuery> = {
     requestTimeout: "5s"
 };
 
+/**
+ * The query types that can be used for annotations. An annotation is a one-shot query over the
+ * dashboard's time range, so "SUBSCRIBE" does not apply: a subscription never completes.
+ */
+export const AnnotationQueryTypes: QueryTypes[] = ["REQUEST_REPLY", "SCRIPT", "KV"];
+
+export const DEFAULT_ANNOTATION_QUERY: Partial<MyQuery> = {
+    queryType: "REQUEST_REPLY",
+    requestTimeout: "5s",
+    jsFn: `// An annotation needs a "time" column. "timeEnd", "title", "text" and "tags" are optional.
+// Use a JS Date for time and timeEnd, and a comma-separated string for tags.
+return JSON.parse(msg.Data).map((event) => ({
+    time: new Date(event.timestamp),
+    title: event.title,
+    text: event.message,
+    tags: "nats"
+}));`
+};
+
 
 type AuthenticationModes = "NONE" | "NKEY" | "USERPASS" | "JWT";
 

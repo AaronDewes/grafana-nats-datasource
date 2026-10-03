@@ -18,6 +18,7 @@ Features:
    - This is useful to show configuration or state stored in KV, or to chart a key's value over time.
 - **Free-Form Script:** This is an advanced mode, which can send **multiple NATS requests**, wait for **multiple responses**
   and do **any kind of processing**. See below for examples.
+- **Annotations:** any non-streaming query can be used as a dashboard annotation. See [below](#annotations).
 - A default **Dashboard** which shows NATS system metrics via the `$SYS` account.
 
 ## Screenshots
@@ -277,6 +278,44 @@ Each KV call is bounded by the *Request Timeout*.
 
 Supported Return values: A map `{k: "v"}`, a list of maps `[{k: "v"}]`,
 a [data.Frame](https://pkg.go.dev/github.com/grafana/grafana-plugin-sdk-go@v0.147.0/data#Frame).
+
+## Annotations
+
+The data source can be selected in a dashboard's *Annotations* settings, next to the usual query
+types - *Request/Reply*, *Key/Value* and *Free-Form Script*. *Subscribe* is not offered, because a
+subscription never completes, and an annotation query has to return a finite result.
+
+Grafana builds the annotation events from the returned data frame. One column is required:
+
+| Column | Meaning |
+| --- | --- |
+| `time` | when the event happened - **required** |
+| `timeEnd` | end of the event; makes it a region |
+| `title` | the event's title |
+| `text` | the event's description |
+| `tags` | tags for the event |
+
+Return one row per event, f.e. as a *Request/Reply* mapping script:
+
+```js
+// msg.Data holds a JSON list like [{"timestamp": "2026-01-01T10:00:00Z", "title": "deploy", "message": "v1.2.3"}]
+return JSON.parse(msg.Data).map((event) => ({
+    time: new Date(event.timestamp),
+    title: event.title,
+    text: event.message,
+    tags: "deploy,nats"
+}));
+```
+
+Two things to keep in mind:
+
+- Use a **JS `Date`** for `time` and `timeEnd`. A plain number ends up as a numeric column rather
+  than a time column.
+- `tags` has to be a **string**, not an array - a comma-separated list is the usual form. Rows
+  cannot contain nested arrays.
+
+If your data does not use these column names, you can map columns to annotation fields explicitly in
+the annotation editor instead of renaming them in the script.
 
 ## Developing
 
